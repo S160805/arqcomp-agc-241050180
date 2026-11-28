@@ -1,27 +1,30 @@
 // =====================================================================
-//  AGC en ESP32 - Laboratorio 11 (Paso 3: Controlador DMA - CORREGIDO)
+//  AGC 5 - Laboratorio 10: interconexion con la PC y adquisicion de datos
 //  Autora: Samantha Naomi Vital Flores
 //  Matrícula: 241050180
 //  Equipo: [pon tu equipo aquí]
-//  Proyecto 1 - Lab 11: DMA y video
+//  Proyecto 1 - Lab 10: Protocolo Houston + Instrumento
 // =====================================================================
 
-// Funciona:
-// - Simula una CPU con PC, A, Q, IR y ejecuta programa en ROM
-// - Usa DMA para mover datos de memoria sin usar la CPU (robo de ciclos y ráfaga)
+// ## Funciona:
+// - Simula CPU con PC, A, Q, IR y ejecuta programa en ROM
+// - Interconexion con PC por Monitor Serie a 115200 baudios
+// - Protocolo Houston: comandos V, W, B, F, T, M
 // - Lee MPU6050, joystick y botones por interrupciones
 // - Muestra DSKY en OLED y reporta ANCLA en Monitor Serie
-// - Dibuja imagen en VRAM en modo video
 
-// Midió:
-// - Ciclos de CPU y turnos de DMA vs turnos de CPU
-// - Duración de transferencia DMA en microsegundos
-// - Registros de CPU, RAM / IO / ROM / VRAM
-// - Inclinación filtrada y cruda del MPU6050
-// - Tiempo promedio de cada tarea 1 a 5
+// ## Midió:
+// - Inclinacion cruda y filtrada en grados (filtro 1, 8 y 64 muestras)
+// - Tiempo promedio de tareas 1 a 4 en microsegundos
+// - Ancho de banda: 1024 bytes en microsegundos con comando B
+// - Registros de CPU, RAM / IO / ROM, ticks y cola de tareas
+// - Valor del ANCLA y N_SUMA = 7
 
 // =====================================================================
-//  AGC en ESP32 — Laboratorio 11 (Paso 3: Controlador DMA)
+//  AGC 5 - Laboratorio 10: interconexion con la PC y adquisicion de datos
+//  Base del Laboratorio 9 + protocolo Houston (V, W, B) + inclinacion
+//  en grados + filtro de promedio movil (F) + modo instrumento (V27).
+//  Monitor Serie a 115200 baudios, con "Nueva linea".
 // =====================================================================
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -48,9 +51,9 @@ void imprimirAncla() {
 #define RAM_INICIO   0x000
 #define RAM_TAM      64
 #define IO_INICIO    0x040
-#define IO_TAM       32
+#define IO_TAM       16
 #define ROM_INICIO   0x100
-#define ROM_TAM      640
+#define ROM_TAM      64
 
 #define IO_JOY_X     0
 #define IO_JOY_Y     1
@@ -65,38 +68,28 @@ void imprimirAncla() {
 #define IO_ALARMA    10
 #define IO_COLA      11
 #define IO_BOTONES   12
-#define IO_INCL      13
-
-#define IO_DMA_ORIGEN   14
-#define IO_DMA_DESTINO  15
-#define IO_DMA_CONTADOR 16
-#define IO_DMA_CTRL     17
-#define IO_DMA_ESTADO   18
-
-#define VRAM_INICIO  0x800
-#define VRAM_TAM     512
-palabra_t VRAM[VRAM_TAM];
-bool modoVideo = false;
+#define IO_INCL      13               // inclinacion en centesimas de grado
 
 palabra_t RAM[RAM_TAM];
 volatile palabra_t IOREG[IO_TAM];
 bool alarmaMem = false;
 
-// --- VARIABLES DEL DMA MOVIDAS AQUÍ ARRIBA ---
-uint32_t turnosDMA = 0;
-uint32_t turnosCPU = 0;
-uint32_t dmaT0 = 0, dmaDuracion = 0;
-// ---------------------------------------------
-
-palabra_t ROM[ROM_TAM] = {
-  0x100B, 0x6108, 0x300A, 0x400A, 0x100B, 0x300C, 0x400B, 0x0100, 0x7000
+const palabra_t ROM[ROM_TAM] = {
+  0x100B,  // 0x100  CA  0x00B
+  0x6108,  // 0x101  BZF 0x108
+  0x300A,  // 0x102  AD  0x00A
+  0x400A,  // 0x103  TS  0x00A
+  0x100B,  // 0x104  CA  0x00B
+  0x300C,  // 0x105  AD  0x00C
+  0x400B,  // 0x106  TS  0x00B
+  0x0100,  // 0x107  TC  0x100
+  0x7000   // 0x108  HALT
 };
 
 palabra_t leerMem(uint16_t dir) {
   if (dir >= RAM_INICIO && dir < RAM_INICIO + RAM_TAM) return RAM[dir - RAM_INICIO];
   if (dir >= IO_INICIO  && dir < IO_INICIO + IO_TAM)   return IOREG[dir - IO_INICIO];
   if (dir >= ROM_INICIO && dir < ROM_INICIO + ROM_TAM) return ROM[dir - ROM_INICIO];
-  if (dir >= VRAM_INICIO && dir < VRAM_INICIO + VRAM_TAM) return VRAM[dir - VRAM_INICIO];
   alarmaMem = true;
   return 0;
 }
@@ -107,7 +100,6 @@ void escribirMem(uint16_t dir, palabra_t val) {
     if (dir - IO_INICIO != IO_TICKS) IOREG[dir - IO_INICIO] = val;
     return;
   }
-  if (dir >= VRAM_INICIO && dir < VRAM_INICIO + VRAM_TAM) { VRAM[dir - VRAM_INICIO] = val; return; }
   alarmaMem = true;
 }
 
@@ -133,21 +125,22 @@ void cpuPaso(CPU &c) {
   decodificar(c.IR, op, dir);
   palabra_t t;
   switch (op) {
-    case 0: c.Q = pcAnterior + 1; c.PC = dir; break;
-    case 1: c.A = leerMem(dir); break;
-    case 2: c.A = -leerMem(dir); break;
-    case 3: c.A = c.A + leerMem(dir); break;
-    case 4: escribirMem(dir, c.A); break;
-    case 5: t = leerMem(dir); escribirMem(dir, c.A); c.A = t; break;
-    case 6: if (c.A == 0) c.PC = dir; break;
-    case 7: c.detenida = true; break;
+    case 0: c.Q = pcAnterior + 1; c.PC = dir; break;          // TC
+    case 1: c.A = leerMem(dir); break;                        // CA
+    case 2: c.A = -leerMem(dir); break;                       // CS
+    case 3: c.A = c.A + leerMem(dir); break;                  // AD
+    case 4: escribirMem(dir, c.A); break;                     // TS
+    case 5: t = leerMem(dir); escribirMem(dir, c.A); c.A = t; break;  // XCH
+    case 6: if (c.A == 0) c.PC = dir; break;                  // BZF
+    case 7: c.detenida = true; break;                         // HALT
     default: c.detenida = true; alarmaMem = true;
   }
   if (alarmaMem) c.detenida = true;
   c.ciclos++;
 }
 
-#define N_SUMA 4
+// *** CAMBIA ESTE VALOR: ultimo digito de tu numero de control + 3 (si termina en 0, usa 10) ***
+#define N_SUMA 7
 
 void prepararPrograma() {
   RAM[10] = 0;
@@ -159,38 +152,49 @@ void prepararPrograma() {
   cpuReset(cpu);
 }
 
-// ---------------- MPU6050 ----------------
+// ---------------- MPU6050 sin libreria ----------------
 #define MPU_DIR 0x68
+
 void mpuDespertar() {
   Wire.beginTransmission(MPU_DIR);
-  Wire.write(0x6B); Wire.write(0); Wire.endTransmission();
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission();
 }
+
 void mpuLeer() {
   Wire.beginTransmission(MPU_DIR);
-  Wire.write(0x3B); Wire.endTransmission(false);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
   Wire.requestFrom(MPU_DIR, 14);
   int16_t v[7];
   for (int i = 0; i < 7; i++) {
-    int16_t alto = Wire.read(); int16_t bajo = Wire.read();
+    int16_t alto = Wire.read();
+    int16_t bajo = Wire.read();
     v[i] = (alto << 8) | (bajo & 0xFF);
   }
   IOREG[IO_ACC_X] = v[0]; IOREG[IO_ACC_Y] = v[1]; IOREG[IO_ACC_Z] = v[2];
   IOREG[IO_GYR_X] = v[4]; IOREG[IO_GYR_Y] = v[5]; IOREG[IO_GYR_Z] = v[6];
 }
 
+// ---------------- Entrada ----------------
 void leerEntrada() {
   IOREG[IO_JOY_X] = analogRead(34);
   IOREG[IO_JOY_Y] = analogRead(35);
   IOREG[IO_JOY_SW] = digitalRead(32);
-  IOREG[IO_BOTONES] = (!digitalRead(25)) | (!digitalRead(26)) << 1 | (!digitalRead(27)) << 2 | (!digitalRead(32)) << 3;
+  IOREG[IO_BOTONES] = (!digitalRead(25))      |
+                      (!digitalRead(26)) << 1 |
+                      (!digitalRead(27)) << 2 |
+                      (!digitalRead(32)) << 3;
 }
 
-// ---------------- Interrupciones y Tareas ----------------
+// ---------------- Interrupciones ----------------
 hw_timer_t *timerAGC = nullptr;
 volatile uint32_t ticksISR = 0;
 volatile bool tareaPendiente = false;
 uint32_t periodoMs = 100;
 
+// ---------------- Cola de tareas ----------------
 #define COLA_CAP 8
 volatile uint8_t colaTareas[COLA_CAP];
 volatile uint8_t colaHead = 0, colaTail = 0, colaN = 0;
@@ -201,7 +205,10 @@ bool IRAM_ATTR encolar(uint8_t tarea) {
   bool cupo = false;
   portENTER_CRITICAL_SAFE(&candadoCola);
   if (colaN < COLA_CAP) {
-    colaTareas[colaTail] = tarea; colaTail = (colaTail + 1) % COLA_CAP; colaN++; cupo = true;
+    colaTareas[colaTail] = tarea;
+    colaTail = (colaTail + 1) % COLA_CAP;
+    colaN++;
+    cupo = true;
   }
   portEXIT_CRITICAL_SAFE(&candadoCola);
   return cupo;
@@ -211,19 +218,28 @@ bool desencolar(uint8_t &tarea) {
   bool habia = false;
   portENTER_CRITICAL(&candadoCola);
   if (colaN > 0) {
-    tarea = colaTareas[colaHead]; colaHead = (colaHead + 1) % COLA_CAP; colaN--; habia = true;
+    tarea = colaTareas[colaHead];
+    colaHead = (colaHead + 1) % COLA_CAP;
+    colaN--;
+    habia = true;
   }
   portEXIT_CRITICAL(&candadoCola);
   return habia;
 }
 
 void IRAM_ATTR pedir(uint8_t tarea) {
-  if (!encolar(tarea)) { IOREG[IO_ALARMA] = 1202; hay1202 = true; }
+  if (!encolar(tarea)) {
+    IOREG[IO_ALARMA] = 1202;
+    hay1202 = true;
+  }
 }
 
 void IRAM_ATTR onTimer() {
-  ticksISR++; IOREG[IO_TICKS] = (palabra_t)ticksISR;
-  pedir(1); pedir(2); pedir(4);
+  ticksISR++;
+  IOREG[IO_TICKS] = (palabra_t)ticksISR;
+  pedir(1);
+  pedir(2);
+  pedir(4);
   if (ticksISR % 3 == 0) pedir(3);
 }
 
@@ -234,17 +250,26 @@ volatile uint32_t ultimoEntr = 0;
 void IRAM_ATTR onEntr() {
   uint32_t ahora = millis();
   if (ahora - ultimoEntr >= ANTIRREBOTE_MS) {
-    eventosEntr++; ultimoEntr = ahora; pedir(3);
+    eventosEntr++;
+    ultimoEntr = ahora;
+    pedir(3);
   }
 }
 
 void iniciarTimer(uint32_t ms) {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  if (timerAGC == nullptr) { timerAGC = timerBegin(1000000); timerAttachInterrupt(timerAGC, &onTimer); }
+  if (timerAGC == nullptr) {
+    timerAGC = timerBegin(1000000);
+    timerAttachInterrupt(timerAGC, &onTimer);
+  }
   timerAlarm(timerAGC, ms * 1000, true, 0);
 #else
-  if (timerAGC == nullptr) { timerAGC = timerBegin(0, 80, true); timerAttachInterrupt(timerAGC, &onTimer, true); }
-  timerAlarmWrite(timerAGC, ms * 1000, true); timerAlarmEnable(timerAGC);
+  if (timerAGC == nullptr) {
+    timerAGC = timerBegin(0, 80, true);
+    timerAttachInterrupt(timerAGC, &onTimer, true);
+  }
+  timerAlarmWrite(timerAGC, ms * 1000, true);
+  timerAlarmEnable(timerAGC);
 #endif
   periodoMs = ms;
 }
@@ -259,8 +284,7 @@ void registrosDelSustantivo(int32_t r[3]) {
     case 1:  r[0] = leerMem(RAM[0]); r[1] = leerMem(RAM[1]); r[2] = leerMem(RAM[2]); break;
     case 20: r[0] = IOREG[IO_GYR_X]; r[1] = IOREG[IO_GYR_Y]; r[2] = IOREG[IO_GYR_Z]; break;
     case 21: r[0] = IOREG[IO_COLA];  r[1] = IOREG[IO_ALARMA]; r[2] = ticksISR; break;
-    case 22: r[0] = IOREG[IO_DMA_CONTADOR]; r[1] = IOREG[IO_DMA_ESTADO]; r[2] = turnosCPU; break;
-    case 23: r[0] = IOREG[IO_INCL]; r[1] = IOREG[IO_ACC_Y]; r[2] = IOREG[IO_ACC_Z]; break;
+    case 23: r[0] = IOREG[IO_INCL];  r[1] = IOREG[IO_ACC_Y]; r[2] = IOREG[IO_ACC_Z]; break;
     case 60: r[0] = IOREG[IO_JOY_X]; r[1] = IOREG[IO_JOY_Y]; r[2] = IOREG[IO_BOTONES]; break;
     case 70: r[0] = cpu.PC; r[1] = cpu.A; r[2] = (uint16_t)cpu.IR; break;
     case 71: r[0] = cpu.Q;  r[1] = cpu.ciclos; r[2] = cpu.detenida; break;
@@ -270,9 +294,16 @@ void registrosDelSustantivo(int32_t r[3]) {
 void refrescarOLED() {
   int32_t r[3];
   registrosDelSustantivo(r);
-  oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE); oled.setCursor(0, 0);
-  if (IOREG[IO_ALARMA] != 0) { oled.fillRect(0, 0, 24, 9, SSD1306_WHITE); oled.setTextColor(SSD1306_BLACK); }
-  oled.print("PROG"); oled.setTextColor(SSD1306_WHITE);
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(0, 0);
+  if (IOREG[IO_ALARMA] != 0) {
+    oled.fillRect(0, 0, 24, 9, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+  }
+  oled.print("PROG");
+  oled.setTextColor(SSD1306_WHITE);
   oled.printf("  V %02d   N %02d", verbo, sustantivo);
   for (int i = 0; i < 3; i++) {
     oled.setCursor(0, 18 + i * 14);
@@ -282,76 +313,17 @@ void refrescarOLED() {
   oled.display();
 }
 
-// ---------------- Imagen en ROM y memoria de video ----------------
-#define IMAGEN_INICIO 0x140
-
-void quemarImagen() {
-  for (int y = 0; y < 64; y++) {
-    for (int k = 0; k < 8; k++) {
-      uint16_t v = 0;
-      for (int b = 0; b < 16; b++) {
-        int x = k * 16 + b;
-        bool encendido = (x == 0 || x == 127 || y == 0 || y == 63 || x / 2 == y || (127 - x) / 2 == y);
-        v = (v << 1) | encendido;
-      }
-      ROM[IMAGEN_INICIO - ROM_INICIO + y * 8 + k] = (palabra_t)v;
-    }
-  }
-}
-
-void dibujarVRAM() {
-  oled.clearDisplay();
-  for (int k = 0; k < VRAM_TAM; k++) {
-    int fila = k / 8;
-    int col0 = (k % 8) * 16;
-    for (int b = 0; b < 16; b++)
-      if ((uint16_t)VRAM[k] & (1 << (15 - b))) oled.drawPixel(col0 + b, fila, SSD1306_WHITE);
-  }
-  oled.display();
-}
-
-// ---------------- Controlador DMA ----------------
-bool dmaArrancado() { return IOREG[IO_DMA_CTRL] & 1; }
-
-void dmaUnaPalabra() {
-  escribirMem(IOREG[IO_DMA_DESTINO], leerMem(IOREG[IO_DMA_ORIGEN]));
-  IOREG[IO_DMA_ORIGEN]   = IOREG[IO_DMA_ORIGEN] + 1;
-  IOREG[IO_DMA_DESTINO]  = IOREG[IO_DMA_DESTINO] + 1;
-  IOREG[IO_DMA_CONTADOR] = IOREG[IO_DMA_CONTADOR] - 1;
-  turnosDMA++;
-  if (IOREG[IO_DMA_CONTADOR] <= 0 || alarmaMem) {
-    IOREG[IO_DMA_ESTADO] = alarmaMem ? 3 : 2;
-    IOREG[IO_DMA_CTRL] = IOREG[IO_DMA_CTRL] & ~1;
-    dmaDuracion = micros() - dmaT0;
-    pedir(5);
-  }
-}
-
-void turno(int n) {
-  if (dmaArrancado()) {
-    if (IOREG[IO_DMA_ESTADO] != 1) {
-      IOREG[IO_DMA_ESTADO] = 1;
-      dmaT0 = micros(); turnosDMA = 0; turnosCPU = 0;
-    }
-    if (IOREG[IO_DMA_CTRL] & 2) {
-      while (dmaArrancado()) dmaUnaPalabra();
-      return;
-    }
-    if (n % 2 == 0) { dmaUnaPalabra(); return; }
-    turnosCPU++;
-  }
-  cpuPaso(cpu);
-}
-
-// ---------------- Instrumento ----------------
+// ---------------- Instrumento (Laboratorio 10) ----------------
 #define FILTRO_MAX 64
 float ventana[FILTRO_MAX];
-int nFiltro = 1, idxV = 0;
+int nFiltro = 1;
+int idxV = 0;
 float inclCruda = 0, inclFiltrada = 0;
 bool modoInstrumento = false;
 
 float filtrar(float x) {
-  ventana[idxV] = x; idxV = (idxV + 1) % nFiltro;
+  ventana[idxV] = x;
+  idxV = (idxV + 1) % nFiltro;
   float suma = 0;
   for (int i = 0; i < nFiltro; i++) suma += ventana[i];
   return suma / nFiltro;
@@ -364,7 +336,8 @@ void cambiarFiltro(int n) {
 }
 
 void medirInclinacion() {
-  float ay = IOREG[IO_ACC_Y]; float az = IOREG[IO_ACC_Z];
+  float ay = IOREG[IO_ACC_Y];
+  float az = IOREG[IO_ACC_Z];
   inclCruda = atan2(ay, az) * 180.0 / PI;
   inclFiltrada = filtrar(inclCruda);
   IOREG[IO_INCL] = (palabra_t)(inclFiltrada * 100);
@@ -374,13 +347,9 @@ void medirInclinacion() {
 // ---------------- Comandos del Monitor Serie ----------------
 void atenderSerie() {
   if (!Serial.available()) return;
-  String cmd = Serial.readStringUntil('\n'); cmd.trim(); cmd.toUpperCase();
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim(); cmd.toUpperCase();
   if (cmd == "M") { reporteTiempos(); return; }
-  if (cmd == "D") {
-    Serial.printf("DMA: turnos quitados a la CPU=%lu  turnos que la CPU uso=%lu  duracion=%lu us  estado=%d\n",
-                  (unsigned long)turnosDMA, (unsigned long)turnosCPU, (unsigned long)dmaDuracion, IOREG[IO_DMA_ESTADO]);
-    return;
-  }
   if (cmd.startsWith("W")) {
     int coma = cmd.indexOf(',');
     if (coma > 1) {
@@ -392,71 +361,90 @@ void atenderSerie() {
     return;
   }
   if (cmd == "B") {
-    Serial.flush(); uint32_t t0 = micros();
+    Serial.flush();
+    uint32_t t0 = micros();
     for (int i = 0; i < 1024; i++) Serial.write('U');
-    Serial.flush(); uint32_t dt = micros() - t0;
+    Serial.flush();
+    uint32_t dt = micros() - t0;
     Serial.printf("\n1024 bytes en %lu us\n", (unsigned long)dt);
     return;
   }
-  if (cmd.startsWith("F")) { cambiarFiltro(cmd.substring(1).toInt()); Serial.printf("Filtro = %d muestras\n", nFiltro); return; }
+  if (cmd.startsWith("F")) {
+    cambiarFiltro(cmd.substring(1).toInt());
+    Serial.printf("Filtro = %d muestras\n", nFiltro);
+    return;
+  }
   if (cmd.startsWith("T")) {
     long ms = cmd.substring(1).toInt();
     if (ms >= 1 && ms <= 1000) { iniciarTimer(ms); Serial.printf("Periodo = %ld ms\n", ms); }
     return;
   }
   if (cmd.startsWith("V")) {
-    int v = cmd.substring(1, 3).toInt(); int n = cmd.indexOf('N');
+    int v = cmd.substring(1, 3).toInt();
+    int n = cmd.indexOf('N');
     if (v == 15) { cpuPaso(cpu); }
     else if (v == 16) { while (!cpu.detenida) cpuPaso(cpu); }
     else if (v == 37) { cpuReset(cpu); }
-    else if (v == 35) { modoVideo = !modoVideo; }
-    else if (v == 36) { memset(VRAM, 0, sizeof(VRAM)); }
     else { verbo = v; modoInstrumento = (v == 27); }
     if (n > 0) sustantivo = cmd.substring(n + 1).toInt();
     Serial.printf("V %02d  N %02d\n", verbo, sustantivo);
   }
 }
 
-// ---------------- Tareas ----------------
-uint32_t tiempoTotal[6] = {0};
-uint32_t vecesTarea[6]  = {0};
+// ---------------- Tareas y medicion ----------------
+uint32_t tiempoTotal[5] = {0};
+uint32_t vecesTarea[5]  = {0};
 
 void ejecutarTarea(uint8_t tarea) {
   uint32_t t0 = micros();
   switch (tarea) {
     case 1: mpuLeer(); medirInclinacion(); break;
     case 2: leerEntrada(); break;
-    case 3: if (modoVideo) dibujarVRAM(); else refrescarOLED(); break;
-    case 4: for (int i = 0; i < 10; i++) turno(i); break;
-    case 5: escribirMem(21, 1); break;
+    case 3: refrescarOLED(); break;
+    case 4: for (int i = 0; i < 10; i++) cpuPaso(cpu); break;
   }
-  tiempoTotal[tarea] += micros() - t0; vecesTarea[tarea]++;
+  tiempoTotal[tarea] += micros() - t0;
+  vecesTarea[tarea]++;
 }
 
 void reporteTiempos() {
-  for (int t = 1; t <= 5; t++) {
+  for (int t = 1; t <= 4; t++) {
     uint32_t prom = vecesTarea[t] ? tiempoTotal[t] / vecesTarea[t] : 0;
     Serial.printf("Tarea %d: %lu us en promedio (%lu veces)\n", t, (unsigned long)prom, (unsigned long)vecesTarea[t]);
     tiempoTotal[t] = 0; vecesTarea[t] = 0;
   }
 }
 
+// ---------------- Recuperacion 1202 ----------------
 void recuperar1202() {
   portENTER_CRITICAL(&candadoCola);
   colaHead = 0; colaTail = 0; colaN = 0;
   portEXIT_CRITICAL(&candadoCola);
-  cpuReset(cpu); encolar(1); RAM[20]++; hay1202 = false;
+  cpuReset(cpu);
+  encolar(1);
+  RAM[20]++;
+  hay1202 = false;
 }
 
+// ---------------- Programa principal ----------------
 uint32_t ultimoReporte = 0;
 
 void setup() {
-  Serial.begin(115200); delay(300); imprimirAncla();
-  pinMode(32, INPUT_PULLUP); pinMode(25, INPUT_PULLUP); pinMode(26, INPUT_PULLUP); pinMode(27, INPUT_PULLUP);
-  Wire.begin(21, 22); Wire.setClock(400000); mpuDespertar();
+  Serial.begin(115200);
+  delay(300);
+  imprimirAncla();
+
+  pinMode(32, INPUT_PULLUP);
+  pinMode(25, INPUT_PULLUP);
+  pinMode(26, INPUT_PULLUP);
+  pinMode(27, INPUT_PULLUP);
+
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+  mpuDespertar();
   if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) Serial.println("OLED no responde en 0x3C");
+
   prepararPrograma();
-  quemarImagen();
   attachInterrupt(digitalPinToInterrupt(32), onEntr, FALLING);
   iniciarTimer(100);
   Serial.println("AGC listo. Escribe V06N20 y presiona Enter.");
@@ -464,13 +452,18 @@ void setup() {
 
 void loop() {
   atenderSerie();
+
   uint8_t tarea;
   if (desencolar(tarea)) ejecutarTarea(tarea);
   IOREG[IO_COLA] = colaN;
+
   if (hay1202) recuperar1202();
+
   if (!modoInstrumento && millis() - ultimoReporte >= 1000) {
-    ultimoReporte = millis(); int32_t r[3];
+    ultimoReporte = millis();
+    int32_t r[3];
     registrosDelSustantivo(r);
-    Serial.printf("T=%lu V=%02d N=%02d R1=%ld R2=%ld R3=%ld\n", (unsigned long)ticksISR, verbo, sustantivo, (long)r[0], (long)r[1], (long)r[2]);
+    Serial.printf("T=%lu V=%02d N=%02d R1=%ld R2=%ld R3=%ld\n", (unsigned long)ticksISR,
+                  verbo, sustantivo, (long)r[0], (long)r[1], (long)r[2]);
   }
 }
